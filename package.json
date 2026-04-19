@@ -11,6 +11,7 @@
   "dependencies": {
     "expo": "~54.0.33",
     "expo-location": "~19.0.8",
+    "expo-notifications": "~0.32.16",
     "expo-status-bar": "~3.0.9",
     "expo-task-manager": "~14.0.9",
     "react": "19.1.0",

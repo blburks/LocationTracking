@@ -1,6 +1,7 @@
 import { registerRootComponent } from 'expo';
 import { StatusBar } from 'expo-status-bar';
 import * as Location from 'expo-location';
+import * as Notifications from 'expo-notifications';
 import * as TaskManager from 'expo-task-manager';
 import { useEffect, useRef, useState } from 'react';
 import {
@@ -11,6 +12,7 @@ import {
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
   View,
 } from 'react-native';
@@ -19,6 +21,19 @@ import {
 
 const LOCATION_TASK = 'background-location-task';
 const LOCATION_UPDATE_EVENT = 'bmt_location_update';
+const DEFAULT_GOAL_KM = 1.0;
+
+// ─── Notification handler (must be set before any scheduling) ─────────────────
+
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowAlert: true,
+    shouldShowBanner: true,
+    shouldShowList: true,
+    shouldPlaySound: true,
+    shouldSetBadge: false,
+  }),
+});
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -30,20 +45,10 @@ type Coordinate = {
 
 // ─── Module-level track log ───────────────────────────────────────────────────
 
-/**
- * Shared between the background task callback and the UI.
- * In Expo's managed workflow both run in the same JS context.
- * Never cleared on pause/resume — only on a fresh Start.
- */
 const trackLog: Coordinate[] = [];
 
 // ─── Background task ──────────────────────────────────────────────────────────
 
-/**
- * Defined at module scope (required by expo-task-manager).
- * Emits LOCATION_UPDATE_EVENT so the UI listener receives updates whether the
- * app is in the foreground or just returned from the background.
- */
 TaskManager.defineTask(
   LOCATION_TASK,
   async ({
@@ -86,6 +91,26 @@ const FG_WATCH_OPTIONS: Location.LocationOptions = {
   distanceInterval: 1,
 };
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6371;
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+async function sendNotification(title: string, body: string) {
+  await Notifications.scheduleNotificationAsync({
+    content: { title, body },
+    trigger: null,
+  });
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 
 function App() {
@@ -97,24 +122,32 @@ function App() {
   const [backgroundMode, setBackgroundMode] = useState(false);
   const [logLength, setLogLength] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [totalDistanceKm, setTotalDistanceKm] = useState(0);
+  const [goalKmInput, setGoalKmInput] = useState(String(DEFAULT_GOAL_KM));
 
   const subscriberRef = useRef<Location.LocationSubscription | null>(null);
+  const distanceRef = useRef(0);
+  const goalReachedRef = useRef(false);
 
-  // ── Effects ────────────────────────────────────────────────────────────────
+  const goalKm = parseFloat(goalKmInput) || DEFAULT_GOAL_KM;
 
-  /**
-   * Unified coordinate listener.
-   * Both the background TaskManager callback and the foreground watchPositionAsync
-   * callback emit LOCATION_UPDATE_EVENT, so this single handler drives all UI
-   * updates regardless of which tracking path is active.
-   *
-   * State transition coverage:
-   *   • Foreground tracking active   → fires on every new fix
-   *   • Background task active       → fires when OS delivers a fix (both while
-   *                                    backgrounded and after returning to fg)
-   *   • Paused                       → never fires (GPS detached)
-   *   • Stopped                      → never fires (GPS detached + event removed)
-   */
+  // ── Request notification permission on mount ───────────────────────────────
+
+  useEffect(() => {
+    (async () => {
+      const { status } = await Notifications.requestPermissionsAsync();
+      if (status !== 'granted') {
+        Alert.alert(
+          'Notifications Disabled',
+          'Enable notifications in your device settings to receive tracking alerts.',
+          [{ text: 'OK' }]
+        );
+      }
+    })();
+  }, []);
+
+  // ── Location event listener ────────────────────────────────────────────────
+
   useEffect(() => {
     const sub = DeviceEventEmitter.addListener(
       LOCATION_UPDATE_EVENT,
@@ -122,17 +155,34 @@ function App() {
         setLatitude(coord.latitude);
         setLongitude(coord.longitude);
         setLogLength(trackLog.length);
+
+        if (trackLog.length >= 2) {
+          const prev = trackLog[trackLog.length - 2];
+          const curr = trackLog[trackLog.length - 1];
+          const delta = haversineKm(
+            prev.latitude,
+            prev.longitude,
+            curr.latitude,
+            curr.longitude
+          );
+          distanceRef.current += delta;
+          setTotalDistanceKm(distanceRef.current);
+
+          if (!goalReachedRef.current && distanceRef.current >= goalKm) {
+            goalReachedRef.current = true;
+            sendNotification(
+              'Goal Reached!',
+              `Amazing work! You've traveled ${goalKm.toFixed(2)} km. Keep it up!`
+            );
+          }
+        }
       }
     );
     return () => sub.remove();
-  }, []);
+  }, [goalKm]);
 
-  /**
-   * Restore tracking state if the background task survived an app restart.
-   * iOS can keep a background location task alive even after the app is killed.
-   * On relaunch the JS state would be reset to idle, so we check the OS and
-   * reconcile.
-   */
+  // ── Restore tracking state after app restart ───────────────────────────────
+
   useEffect(() => {
     async function restoreTrackingState() {
       try {
@@ -140,9 +190,6 @@ function App() {
         if (isRunning) {
           setTracking(true);
           setBackgroundMode(true);
-          // trackLog will repopulate as the next background fix arrives and
-          // DeviceEventEmitter fires. If there are already entries (same JS
-          // context restart), sync the display immediately.
           if (trackLog.length > 0) {
             const latest = trackLog[trackLog.length - 1];
             setLatitude(latest.latitude);
@@ -151,24 +198,14 @@ function App() {
           }
         }
       } catch {
-        // hasStartedLocationUpdatesAsync throws if task manager isn't ready;
-        // safe to ignore — app just starts in idle state.
+        // safe to ignore — app starts in idle state
       }
     }
     restoreTrackingState();
   }, []);
 
-  /**
-   * Safety-net sync when the app returns to the foreground.
-   * Covers the gap between the last background fix and when the UI renders,
-   * ensuring the most recent logged coordinate is always shown immediately on
-   * foreground return.
-   *
-   * State transition coverage:
-   *   • BG → FG (active tracking)  → shows latest coord from trackLog
-   *   • BG → FG (paused)           → shows last coord before pause (no change)
-   *   • BG → FG (stopped)          → trackLog.length === 0, no-op
-   */
+  // ── Sync on foreground return ──────────────────────────────────────────────
+
   useEffect(() => {
     const sub = AppState.addEventListener('change', (nextState) => {
       if (nextState === 'active' && trackLog.length > 0) {
@@ -183,12 +220,6 @@ function App() {
 
   // ── Helpers ────────────────────────────────────────────────────────────────
 
-  /**
-   * Starts a foreground watchPositionAsync subscription.
-   * Emits LOCATION_UPDATE_EVENT on every fix so the unified listener updates
-   * the UI — same path as the background task.
-   * Shared between startTracking (foreground-only) and resumeTracking.
-   */
   async function attachForegroundSubscription() {
     const subscription = await Location.watchPositionAsync(
       FG_WATCH_OPTIONS,
@@ -205,7 +236,6 @@ function App() {
     subscriberRef.current = subscription;
   }
 
-  /** Tears down GPS updates without ending the session. */
   async function detachGps() {
     if (backgroundMode) {
       await Location.stopLocationUpdatesAsync(LOCATION_TASK);
@@ -274,9 +304,12 @@ function App() {
         );
       });
 
-      // Start a new session — clear any previous log
+      // Reset session state
       trackLog.length = 0;
+      distanceRef.current = 0;
+      goalReachedRef.current = false;
       setLogLength(0);
+      setTotalDistanceKm(0);
 
       if (isBackground) {
         await Location.startLocationUpdatesAsync(LOCATION_TASK, BG_TASK_OPTIONS);
@@ -297,16 +330,14 @@ function App() {
 
   // ── Pause tracking ─────────────────────────────────────────────────────────
 
-  /**
-   * Stops GPS updates and enters paused state.
-   * trackLog is NOT cleared — session data is fully preserved.
-   * The paused flag survives background/foreground cycles since it is React
-   * component state (the JS context is not killed on minimize).
-   */
   async function pauseTracking() {
     try {
       await detachGps();
       setPaused(true);
+      await sendNotification(
+        'Tracking Paused',
+        "Your location tracking has been paused. Open the app and tap \"Resume Tracking\" when you're ready to continue."
+      );
     } catch {
       setError('Unable to pause tracking. Please try again.');
     }
@@ -314,10 +345,6 @@ function App() {
 
   // ── Resume tracking ────────────────────────────────────────────────────────
 
-  /**
-   * Restarts GPS updates from paused state.
-   * trackLog continues from where it left off — no data loss.
-   */
   async function resumeTracking() {
     setError(null);
     setLoading(true);
@@ -338,11 +365,6 @@ function App() {
 
   // ── Stop tracking ──────────────────────────────────────────────────────────
 
-  /**
-   * Fully ends the tracking session.
-   * GPS is detached, all tracking state is reset.
-   * Coordinates remain visible on screen but will not update.
-   */
   async function stopTracking() {
     try {
       await detachGps();
@@ -359,7 +381,6 @@ function App() {
 
   return (
     <View style={styles.container}>
-      {/* ── Scrollable main content ── */}
       <ScrollView
         style={styles.scroll}
         contentContainerStyle={styles.scrollContent}
@@ -367,7 +388,25 @@ function App() {
       >
         <Text style={styles.title}>BuildMyTracks</Text>
 
-        {/* Get Current Location — disabled while a session is running */}
+        {/* Distance goal input */}
+        {!tracking && (
+          <View style={styles.goalCard}>
+            <Text style={styles.goalLabel}>Distance Goal (km)</Text>
+            <TextInput
+              style={styles.goalInput}
+              value={goalKmInput}
+              onChangeText={setGoalKmInput}
+              keyboardType="decimal-pad"
+              placeholder="e.g. 1.0"
+              placeholderTextColor="#a0aec0"
+            />
+            <Text style={styles.goalHint}>
+              You'll get a notification when you reach this distance.
+            </Text>
+          </View>
+        )}
+
+        {/* Get Current Location */}
         <TouchableOpacity
           style={[styles.button, (isBusy || tracking) && styles.buttonDisabled]}
           onPress={getLocation}
@@ -380,7 +419,7 @@ function App() {
           )}
         </TouchableOpacity>
 
-        {/* Start / Pause / Resume — mutually exclusive with the stop button */}
+        {/* Start / Pause / Resume */}
         {!tracking ? (
           <TouchableOpacity
             style={[styles.button, styles.buttonTrack, isBusy && styles.buttonDisabled]}
@@ -445,9 +484,22 @@ function App() {
             <Text style={styles.coordsLabel}>Longitude</Text>
             <Text style={styles.coordsValue}>{longitude.toFixed(6)}</Text>
             {logLength > 0 && (
-              <Text style={styles.logCount}>
-                {logLength} point{logLength !== 1 ? 's' : ''} logged
-              </Text>
+              <>
+                <Text style={styles.logCount}>
+                  {logLength} point{logLength !== 1 ? 's' : ''} logged
+                </Text>
+                <Text style={styles.distanceText}>
+                  Distance: {(totalDistanceKm * 1000).toFixed(0)} m
+                  {totalDistanceKm >= 1 ? ` (${totalDistanceKm.toFixed(2)} km)` : ''}
+                </Text>
+                {tracking && (
+                  <Text style={styles.goalProgressText}>
+                    Goal: {Math.min(100, (totalDistanceKm / goalKm) * 100).toFixed(0)}% of{' '}
+                    {goalKm.toFixed(2)} km
+                    {goalReachedRef.current ? ' ✓' : ''}
+                  </Text>
+                )}
+              </>
             )}
           </View>
         )}
@@ -459,7 +511,7 @@ function App() {
         )}
       </ScrollView>
 
-      {/* ── Privacy & data notice — always visible at the bottom ── */}
+      {/* Privacy & data notice */}
       <View style={styles.privacyCard}>
         <Text style={styles.privacyTitle}>Data & Privacy</Text>
 
@@ -529,6 +581,37 @@ const styles = StyleSheet.create({
     color: '#1a202c',
     marginBottom: 16,
     letterSpacing: 0.5,
+  },
+  goalCard: {
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    padding: 16,
+    width: '100%',
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+  },
+  goalLabel: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#4a5568',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    marginBottom: 8,
+  },
+  goalInput: {
+    borderWidth: 1,
+    borderColor: '#cbd5e0',
+    borderRadius: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    fontSize: 16,
+    color: '#2d3748',
+    backgroundColor: '#f7fafc',
+  },
+  goalHint: {
+    marginTop: 6,
+    fontSize: 11,
+    color: '#a0aec0',
   },
   button: {
     backgroundColor: '#3b82f6',
@@ -627,6 +710,18 @@ const styles = StyleSheet.create({
     marginTop: 12,
     fontSize: 12,
     color: '#a0aec0',
+    fontWeight: '500',
+  },
+  distanceText: {
+    marginTop: 4,
+    fontSize: 14,
+    color: '#4a5568',
+    fontWeight: '600',
+  },
+  goalProgressText: {
+    marginTop: 4,
+    fontSize: 12,
+    color: '#3b82f6',
     fontWeight: '500',
   },
   errorCard: {
