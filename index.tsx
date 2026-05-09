@@ -3,12 +3,14 @@ import { StatusBar } from 'expo-status-bar';
 import * as Location from 'expo-location';
 import * as Notifications from 'expo-notifications';
 import * as TaskManager from 'expo-task-manager';
+import MapView, { Circle, Marker, Polyline } from 'react-native-maps';
 import { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
   AppState,
   DeviceEventEmitter,
+  Dimensions,
   ScrollView,
   StyleSheet,
   Text,
@@ -17,13 +19,29 @@ import {
   View,
 } from 'react-native';
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ─── Constants ─────────────────────────────────────────────────────────────────
 
 const LOCATION_TASK = 'background-location-task';
+const GEOFENCE_TASK = 'geofence-task';
 const LOCATION_UPDATE_EVENT = 'bmt_location_update';
+const GEOFENCE_EVENT = 'bmt_geofence_event';
 const DEFAULT_GOAL_KM = 1.0;
 
-// ─── Notification handler (must be set before any scheduling) ─────────────────
+// Geofence: Bates Technical College, Tacoma, WA
+const GEOFENCE_CENTER = { latitude: 47.2311, longitude: -122.4446 };
+const GEOFENCE_RADIUS_M = 200;
+const GEOFENCE_LABEL = 'Bates Technical College';
+
+const MAP_HEIGHT = Dimensions.get('window').height * 0.4;
+
+const INITIAL_MAP_REGION = {
+  latitude: GEOFENCE_CENTER.latitude,
+  longitude: GEOFENCE_CENTER.longitude,
+  latitudeDelta: 0.008,
+  longitudeDelta: 0.008,
+};
+
+// ─── Notification handler ──────────────────────────────────────────────────────
 
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
@@ -35,7 +53,7 @@ Notifications.setNotificationHandler({
   }),
 });
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ─── Types ─────────────────────────────────────────────────────────────────────
 
 type Coordinate = {
   latitude: number;
@@ -43,11 +61,13 @@ type Coordinate = {
   timestamp: number;
 };
 
-// ─── Module-level track log ───────────────────────────────────────────────────
+type GeofenceStatus = 'unknown' | 'inside' | 'outside';
+
+// ─── Module-level track log ────────────────────────────────────────────────────
 
 const trackLog: Coordinate[] = [];
 
-// ─── Background task ──────────────────────────────────────────────────────────
+// ─── Background location task ──────────────────────────────────────────────────
 
 TaskManager.defineTask(
   LOCATION_TASK,
@@ -71,7 +91,28 @@ TaskManager.defineTask(
   }
 );
 
-// ─── Shared GPS options ───────────────────────────────────────────────────────
+// ─── Geofence task ─────────────────────────────────────────────────────────────
+
+TaskManager.defineTask(
+  GEOFENCE_TASK,
+  async ({
+    data,
+    error,
+  }: {
+    data: { eventType: Location.GeofencingEventType; region: Location.LocationRegion };
+    error: TaskManager.TaskManagerError | null;
+  }) => {
+    if (error) return;
+    const { eventType } = data;
+    if (eventType === Location.GeofencingEventType.Enter) {
+      DeviceEventEmitter.emit(GEOFENCE_EVENT, { type: 'enter' });
+    } else if (eventType === Location.GeofencingEventType.Exit) {
+      DeviceEventEmitter.emit(GEOFENCE_EVENT, { type: 'exit' });
+    }
+  }
+);
+
+// ─── GPS task options ──────────────────────────────────────────────────────────
 
 const BG_TASK_OPTIONS: Location.LocationTaskOptions = {
   accuracy: Location.Accuracy.High,
@@ -91,7 +132,7 @@ const FG_WATCH_OPTIONS: Location.LocationOptions = {
   distanceInterval: 1,
 };
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Helpers ───────────────────────────────────────────────────────────────────
 
 function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
   const R = 6371;
@@ -111,7 +152,7 @@ async function sendNotification(title: string, body: string) {
   });
 }
 
-// ─── Component ────────────────────────────────────────────────────────────────
+// ─── Component ─────────────────────────────────────────────────────────────────
 
 function App() {
   const [latitude, setLatitude] = useState<number | null>(null);
@@ -124,14 +165,18 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [totalDistanceKm, setTotalDistanceKm] = useState(0);
   const [goalKmInput, setGoalKmInput] = useState(String(DEFAULT_GOAL_KM));
+  const [pathCoords, setPathCoords] = useState<Coordinate[]>([]);
+  const [geofenceStatus, setGeofenceStatus] = useState<GeofenceStatus>('unknown');
+  const [geofenceMessage, setGeofenceMessage] = useState<string | null>(null);
 
   const subscriberRef = useRef<Location.LocationSubscription | null>(null);
   const distanceRef = useRef(0);
   const goalReachedRef = useRef(false);
+  const mapRef = useRef<MapView>(null);
 
   const goalKm = parseFloat(goalKmInput) || DEFAULT_GOAL_KM;
 
-  // ── Request notification permission on mount ───────────────────────────────
+  // ── Notification permission ────────────────────────────────────────────────
 
   useEffect(() => {
     (async () => {
@@ -155,6 +200,17 @@ function App() {
         setLatitude(coord.latitude);
         setLongitude(coord.longitude);
         setLogLength(trackLog.length);
+        setPathCoords([...trackLog]);
+
+        mapRef.current?.animateToRegion(
+          {
+            latitude: coord.latitude,
+            longitude: coord.longitude,
+            latitudeDelta: 0.005,
+            longitudeDelta: 0.005,
+          },
+          800
+        );
 
         if (trackLog.length >= 2) {
           const prev = trackLog[trackLog.length - 2];
@@ -181,6 +237,36 @@ function App() {
     return () => sub.remove();
   }, [goalKm]);
 
+  // ── Geofence event listener ────────────────────────────────────────────────
+
+  useEffect(() => {
+    const sub = DeviceEventEmitter.addListener(
+      GEOFENCE_EVENT,
+      ({ type }: { type: 'enter' | 'exit' }) => {
+        if (type === 'enter') {
+          setGeofenceStatus('inside');
+          setGeofenceMessage(`You entered ${GEOFENCE_LABEL}`);
+          Alert.alert(
+            'Geofence Entry',
+            `You have entered the geofenced area around ${GEOFENCE_LABEL}.`,
+            [{ text: 'OK' }]
+          );
+          sendNotification('Geofence Entry', `You entered ${GEOFENCE_LABEL}`);
+        } else {
+          setGeofenceStatus('outside');
+          setGeofenceMessage(`You exited ${GEOFENCE_LABEL}`);
+          Alert.alert(
+            'Geofence Exit',
+            `You have exited the geofenced area around ${GEOFENCE_LABEL}.`,
+            [{ text: 'OK' }]
+          );
+          sendNotification('Geofence Exit', `You exited ${GEOFENCE_LABEL}`);
+        }
+      }
+    );
+    return () => sub.remove();
+  }, []);
+
   // ── Restore tracking state after app restart ───────────────────────────────
 
   useEffect(() => {
@@ -195,6 +281,7 @@ function App() {
             setLatitude(latest.latitude);
             setLongitude(latest.longitude);
             setLogLength(trackLog.length);
+            setPathCoords([...trackLog]);
           }
         }
       } catch {
@@ -213,12 +300,13 @@ function App() {
         setLatitude(latest.latitude);
         setLongitude(latest.longitude);
         setLogLength(trackLog.length);
+        setPathCoords([...trackLog]);
       }
     });
     return () => sub.remove();
   }, []);
 
-  // ── Helpers ────────────────────────────────────────────────────────────────
+  // ── GPS helpers ────────────────────────────────────────────────────────────
 
   async function attachForegroundSubscription() {
     const subscription = await Location.watchPositionAsync(
@@ -245,6 +333,34 @@ function App() {
     }
   }
 
+  async function startGeofence() {
+    try {
+      await Location.startGeofencingAsync(GEOFENCE_TASK, [
+        {
+          identifier: GEOFENCE_LABEL,
+          latitude: GEOFENCE_CENTER.latitude,
+          longitude: GEOFENCE_CENTER.longitude,
+          radius: GEOFENCE_RADIUS_M,
+          notifyOnEnter: true,
+          notifyOnExit: true,
+        },
+      ]);
+    } catch {
+      // Geofencing may not be available on all simulators
+    }
+  }
+
+  async function stopGeofence() {
+    try {
+      const running = await Location.hasStartedGeofencingAsync(GEOFENCE_TASK);
+      if (running) {
+        await Location.stopGeofencingAsync(GEOFENCE_TASK);
+      }
+    } catch {
+      // safe to ignore
+    }
+  }
+
   // ── Get single fix ─────────────────────────────────────────────────────────
 
   async function getLocation() {
@@ -266,6 +382,16 @@ function App() {
 
       setLatitude(loc.coords.latitude);
       setLongitude(loc.coords.longitude);
+
+      mapRef.current?.animateToRegion(
+        {
+          latitude: loc.coords.latitude,
+          longitude: loc.coords.longitude,
+          latitudeDelta: 0.005,
+          longitudeDelta: 0.005,
+        },
+        800
+      );
     } catch {
       setError('Unable to retrieve location. Please ensure GPS is enabled and try again.');
     } finally {
@@ -304,12 +430,15 @@ function App() {
         );
       });
 
-      // Reset session state
+      // Reset session
       trackLog.length = 0;
       distanceRef.current = 0;
       goalReachedRef.current = false;
       setLogLength(0);
       setTotalDistanceKm(0);
+      setPathCoords([]);
+      setGeofenceStatus('unknown');
+      setGeofenceMessage(null);
 
       if (isBackground) {
         await Location.startLocationUpdatesAsync(LOCATION_TASK, BG_TASK_OPTIONS);
@@ -318,6 +447,8 @@ function App() {
         await attachForegroundSubscription();
         setBackgroundMode(false);
       }
+
+      await startGeofence();
 
       setTracking(true);
       setPaused(false);
@@ -368,6 +499,7 @@ function App() {
   async function stopTracking() {
     try {
       await detachGps();
+      await stopGeofence();
     } finally {
       setTracking(false);
       setPaused(false);
@@ -379,8 +511,62 @@ function App() {
 
   const isBusy = loading;
 
+  const geofenceBannerColors =
+    geofenceStatus === 'inside'
+      ? { bg: '#f0fdf4', border: '#86efac', text: '#15803d' }
+      : geofenceStatus === 'outside'
+      ? { bg: '#fff7ed', border: '#fdba74', text: '#c2410c' }
+      : { bg: '#f8fafc', border: '#e2e8f0', text: '#64748b' };
+
   return (
     <View style={styles.container}>
+      {/* ── Map ── */}
+      <MapView
+        ref={mapRef}
+        style={styles.map}
+        initialRegion={INITIAL_MAP_REGION}
+        showsUserLocation
+        showsMyLocationButton
+      >
+        {pathCoords.length >= 2 && (
+          <Polyline
+            coordinates={pathCoords}
+            strokeColor="#3b82f6"
+            strokeWidth={4}
+          />
+        )}
+
+        <Circle
+          center={GEOFENCE_CENTER}
+          radius={GEOFENCE_RADIUS_M}
+          fillColor="rgba(239, 68, 68, 0.12)"
+          strokeColor="rgba(239, 68, 68, 0.7)"
+          strokeWidth={2}
+        />
+
+        <Marker
+          coordinate={GEOFENCE_CENTER}
+          title={GEOFENCE_LABEL}
+          description={`Geofence radius: ${GEOFENCE_RADIUS_M} m`}
+          pinColor="red"
+        />
+      </MapView>
+
+      {/* ── Geofence status banner ── */}
+      {geofenceMessage && (
+        <View
+          style={[
+            styles.geofenceBanner,
+            { backgroundColor: geofenceBannerColors.bg, borderColor: geofenceBannerColors.border },
+          ]}
+        >
+          <Text style={[styles.geofenceBannerText, { color: geofenceBannerColors.text }]}>
+            {geofenceStatus === 'inside' ? '✓ Inside' : '✕ Outside'} — {geofenceMessage}
+          </Text>
+        </View>
+      )}
+
+      {/* ── Controls ── */}
       <ScrollView
         style={styles.scroll}
         contentContainerStyle={styles.scrollContent}
@@ -388,7 +574,6 @@ function App() {
       >
         <Text style={styles.title}>BuildMyTracks</Text>
 
-        {/* Distance goal input */}
         {!tracking && (
           <View style={styles.goalCard}>
             <Text style={styles.goalLabel}>Distance Goal (km)</Text>
@@ -406,7 +591,6 @@ function App() {
           </View>
         )}
 
-        {/* Get Current Location */}
         <TouchableOpacity
           style={[styles.button, (isBusy || tracking) && styles.buttonDisabled]}
           onPress={getLocation}
@@ -419,7 +603,6 @@ function App() {
           )}
         </TouchableOpacity>
 
-        {/* Start / Pause / Resume */}
         {!tracking ? (
           <TouchableOpacity
             style={[styles.button, styles.buttonTrack, isBusy && styles.buttonDisabled]}
@@ -462,7 +645,6 @@ function App() {
           </>
         )}
 
-        {/* Status badge */}
         {tracking && (
           <View style={[styles.trackingBadge, paused && styles.trackingBadgePaused]}>
             <View style={[styles.trackingDot, paused && styles.trackingDotPaused]} />
@@ -476,7 +658,6 @@ function App() {
           </View>
         )}
 
-        {/* Coordinates card */}
         {latitude !== null && longitude !== null && (
           <View style={styles.coordsCard}>
             <Text style={styles.coordsLabel}>Latitude</Text>
@@ -511,7 +692,7 @@ function App() {
         )}
       </ScrollView>
 
-      {/* Privacy & data notice */}
+      {/* ── Privacy notice ── */}
       <View style={styles.privacyCard}>
         <Text style={styles.privacyTitle}>Data & Privacy</Text>
 
@@ -558,12 +739,26 @@ function App() {
   );
 }
 
-// ─── Styles ───────────────────────────────────────────────────────────────────
+// ─── Styles ────────────────────────────────────────────────────────────────────
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#f0f4f8',
+  },
+  map: {
+    width: '100%',
+    height: MAP_HEIGHT,
+  },
+  geofenceBanner: {
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderBottomWidth: 1,
+  },
+  geofenceBannerText: {
+    fontSize: 13,
+    fontWeight: '600',
+    textAlign: 'center',
   },
   scroll: {
     flex: 1,

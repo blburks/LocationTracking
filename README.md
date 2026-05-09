@@ -1,23 +1,33 @@
-# BuildMyTracks v1
+# BuildMyTracks
 
-A React Native mobile app built with Expo that tracks a user's GPS location in real time — including background tracking, pause/resume, and a persistent privacy notice.
+A React Native mobile app built with Expo that tracks a user's GPS location in real time — displaying movement on a live map, drawing the traveled path, and firing alerts when crossing a geofenced area.
+
+## About
+
+Built for **SOFT 211 - Mobile Application Development** at Bates Technical College.
 
 ## Features
 
-- **Get Current Location** — retrieves a single high-accuracy GPS fix and displays latitude and longitude
-- **Live Tracking** — continuously updates coordinates in real time using the device's location service
-- **Background Tracking** — continues logging GPS coordinates when the app is minimized, the screen is locked, or the user switches apps (requires "Allow all the time" permission)
-- **Pause & Resume** — temporarily suspends location updates without clearing the session log; resumes seamlessly from where it left off
-- **Session Log** — tracks the total number of coordinate points recorded during the active session
-- **Privacy Notice** — a persistent on-screen notice explaining what data is collected, when, how it is stored, and how the user can control it
+- **Map View** — full interactive map centered on Bates Technical College with pan and zoom
+- **Live Path Drawing** — a polyline traces the user's exact route on the map as they move
+- **Geofence** — a 200 m radius boundary around Bates Technical College is drawn on the map; the app detects entry and exit events
+- **Geofence Alerts** — crossing the geofence boundary triggers an in-app Alert dialog, a status banner below the map, and a push notification
+- **Get Current Location** — retrieves a single high-accuracy GPS fix and pans the map to the user's position
+- **Live Tracking** — continuously updates coordinates and path in real time
+- **Background Tracking** — continues logging GPS when the app is minimized or the screen is locked
+- **Pause & Resume** — suspends location updates without clearing the session log
+- **Distance Goal** — sends a notification when the user reaches a configurable distance target
+- **Privacy Notice** — persistent on-screen panel explaining what data is collected and how to stop it
 
 ## Tech Stack
 
 | Package | Purpose |
 |---|---|
 | [Expo](https://expo.dev) ~54 | Managed React Native framework |
-| [expo-location](https://docs.expo.dev/versions/latest/sdk/location/) ~19 | Foreground and background GPS access |
-| [expo-task-manager](https://docs.expo.dev/versions/latest/sdk/task-manager/) ~14 | Background location task execution |
+| [react-native-maps](https://github.com/react-native-maps/react-native-maps) 1.20 | Map view, Polyline, Circle, Marker |
+| [expo-location](https://docs.expo.dev/versions/latest/sdk/location/) ~19 | Foreground/background GPS + geofencing |
+| [expo-task-manager](https://docs.expo.dev/versions/latest/sdk/task-manager/) ~14 | Background task execution |
+| [expo-notifications](https://docs.expo.dev/versions/latest/sdk/notifications/) ~0.32 | Push notifications for geofence and goal events |
 | React Native 0.81 | Core mobile UI framework |
 | TypeScript | Static typing |
 
@@ -26,36 +36,51 @@ A React Native mobile app built with Expo that tracks a user's GPS location in r
 ### Prerequisites
 
 - [Node.js](https://nodejs.org) 18 or later
-- [Expo CLI](https://docs.expo.dev/get-started/installation/) — install with `npm install -g expo-cli`
-- A physical device or emulator (GPS features require a real device for full testing)
-- [Expo Go](https://expo.dev/client) app installed on your device
+- A physical device or emulator with GPS support
+- [Expo Go](https://expo.dev/client) installed on your device
 
 ### Installation
 
 ```bash
-# Clone the repository
 git clone https://github.com/blburks/LocationTracking.git
 cd LocationTracking
-
-# Install dependencies
 npm install
-
-# Start the development server
 npx expo start
 ```
 
-Scan the QR code with Expo Go (Android) or the Camera app (iOS) to open the app on your device.
+Scan the QR code with Expo Go (Android) or the Camera app (iOS).
+
+## How It Works
+
+### Map & Path
+
+The map opens centered on the geofence location (Bates Technical College). When Live Tracking is started, each GPS update appends a coordinate to the path array, and the `<Polyline>` component re-renders the route in real time. The map camera follows the user automatically.
+
+### Geofence
+
+When tracking starts, `expo-location.startGeofencingAsync` registers a 200 m circular region around Bates Technical College. The system monitors the device's position against this boundary using a background `TaskManager` task. When the boundary is crossed:
+
+1. The task emits a `DeviceEventEmitter` event to the foreground component
+2. An `Alert` dialog appears
+3. A color-coded status banner updates below the map (green = inside, orange = outside)
+4. A push notification is sent
+
+### Location Simulator Testing
+
+To test geofencing without physical movement, use the Expo Go location simulator (iOS) or a mock location app (Android). Simulate movement in and out of the Bates Technical College coordinates to trigger geofence events.
+
+**Geofence center:** `47.2311, -122.4446` (Bates Technical College, Tacoma, WA)
+**Geofence radius:** 200 meters
 
 ## Permissions
 
-The app requests the following permissions at runtime:
-
 | Permission | When | Why |
 |---|---|---|
-| Location (foreground) | On first use of any tracking feature | Required to read GPS coordinates |
-| Location (background) | When starting live tracking | Required to continue tracking when the app is not in the foreground |
+| Location (foreground) | On first tracking action | Required to read GPS coordinates |
+| Location (background) | When starting live tracking | Required to continue tracking when app is in background |
+| Notifications | On app launch | Required to send geofence and goal alerts |
 
-On Android, background location also requires `ACCESS_BACKGROUND_LOCATION` and a foreground service notification, both of which are configured in `app.json`.
+On Android, background location requires `ACCESS_BACKGROUND_LOCATION` and a foreground service notification — both configured in `app.json`.
 
 On iOS, `NSLocationAlwaysAndWhenInUseUsageDescription` and `UIBackgroundModes: ["location"]` are set in `app.json`.
 
@@ -63,8 +88,8 @@ On iOS, `NSLocationAlwaysAndWhenInUseUsageDescription` and `UIBackgroundModes: [
 
 ```
 LocationTracking/
-├── index.tsx        # App entry point — all UI and tracking logic
-├── app.json         # Expo config (permissions, background modes)
+├── index.tsx        # All app logic: map, tracking, geofence, UI
+├── app.json         # Expo config — permissions, background modes, app metadata
 ├── package.json     # Dependencies
 └── assets/          # App icons and splash screen
 ```
